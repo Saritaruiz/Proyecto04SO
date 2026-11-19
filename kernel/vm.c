@@ -364,6 +364,47 @@ uvmclear(pagetable_t pagetable, uint64 va)
   *pte &= ~PTE_U;
 }
 
+// Atiende una escritura sobre una página copy-on-write de pagetable.
+// Si la página tiene más de una referencia, copia su contenido en una
+// página nueva escribible y suelta una referencia a la vieja. Si es la
+// única referencia, solo devuelve PTE_W y quita PTE_COW.
+// Devuelve 0 si quedó resuelta; -1 si la dirección es inválida, la página
+// no es CoW (código, guarda de pila, USYSCALL) o no hay memoria para copiar.
+// El llamador decide qué hacer con el -1 (matar al proceso o fallar).
+int
+cowfault(pagetable_t pagetable, uint64 va)
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+  uint64 pa;
+
+  if (va >= MAXVA)
+    return -1;
+  va = PGROUNDDOWN(va);
+  pte = walk(pagetable, va, 0);
+  if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+    return -1;
+  if ((*pte & PTE_COW) == 0)
+    return -1; // sin PTE_W y sin PTE_COW: nunca fue escribible
+
+  pa = PTE2PA(*pte);
+
+  if (krefcount((void *)pa) > 1) {
+    char *mem = kalloc(); // sin tomar ningún lock del conteo
+    if (mem == 0)
+      return -1;
+    memmove(mem, (char *)pa, PGSIZE);
+    *pte = PA2PTE(mem) | ((PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW);
+    kfree((void *)pa); // suelta nuestra referencia a la página vieja
+    p->cowcopies++;
+  } else {
+    // única referencia: el otro proceso ya copió o terminó
+    *pte = (*pte | PTE_W) & ~PTE_COW;
+  }
+  p->cowfaults++;
+  return 0;
+}
+
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
@@ -386,6 +427,12 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
     }
 
     pte = walk(pagetable, va0, 0);
+    // si la página es CoW, se copia (o se desbloquea) antes de escribir
+    if (*pte & PTE_COW) {
+      if (cowfault(pagetable, va0) < 0)
+        return -1;
+      pa0 = PTE2PA(*pte);
+    }
     // forbid copyout over read-only user text pages.
     if ((*pte & PTE_W) == 0)
       return -1;
