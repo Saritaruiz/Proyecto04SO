@@ -60,15 +60,88 @@ Sistemas Operativos
 
 ## 1. PTE antes y después de una escritura CoW
 
-_(Persona 2 — pendiente de redactar con la salida de `minidb mapa` en `pruebas/minidb.txt`.)_
+En la salida del comando `minidb mapa`, la primera página de la tabla de la base de datos se ubica en la dirección virtual `0x6000`:
+
+* **Antes de escribir:** `pte 0x0000000021fd11d3` (Dirección física / PA: `0x87f44000`)
+* **Después de escribir:** `pte 0x0000000021fb28d7` (Dirección física / PA: `0x87eca000`)
+
+### Decodificación de los bits de la PTE (RISC-V Sv39)
+
+| Bit | Nombre | Antes (`0x1d3`) | Después (`0x0d7`) | Significado |
+| :--- | :--- | :---: | :---: | :--- |
+| **V** | Valid | **1** | **1** | Entrada válida en la tabla de páginas. |
+| **R** | Read | **1** | **1** | Permiso de lectura concedido. |
+| **W** | Write | **0** | **1** | **Cambio:** Se restaura el permiso de escritura. |
+| **X** | Execute | **0** | **0** | No es código ejecutable. |
+| **U** | User | **1** | **1** | Accesible en modo usuario. |
+| **A** | Accessed | **1** | **1** | La CPU accedió a la página. |
+| **D** | Dirty | **1** | **1** | La página fue modificada. |
+| **COW** | Copy-on-Write (bit 8) | **1** | **0** | **Cambio:** Se elimina la marca de CoW. |
+
+### Explicación del cambio de dirección física en el hijo
+
+Al ejecutar `fork()`, la función `uvmcopy()` compartió la página física `0x87f44000` entre el padre y el hijo, removiendo el permiso de escritura (`W=0`) y activando la marca Copy-on-Write (`COW=1`).
+
+Cuando el hijo intentó escribir en la dirección virtual `0x6000`:
+
+1. El hardware de la MMU detectó `W=0` e interrumpió la ejecución generando un fallo de página por escritura (`scause = 15`).
+2. El manejador `usertrap()` capturó la trampa e invocó la función `cowfault()`.
+3. Al consultar el contador de referencias de la página original (`0x87f44000`), `cowfault()` comprobó que la página estaba compartida (`refcount > 1`).
+4. Por esta razón, reservó una **nueva página física** (`0x87eca000`) mediante `kalloc()`, copió los 4096 bytes de datos y decrementó en 1 el contador de referencias de la página vieja usando `kfree()`.
+5. Finalmente, actualizó la PTE del hijo para mapear la nueva dirección `0x87eca000`, asignándole `W=1` y limpiando `COW=0`.
+
+### Estado de la PTE en el proceso padre
+
+En la tabla del proceso padre **no ocurre ningún cambio en sus bits ni en su dirección física** en el momento en que el hijo escribe:
+
+* Su PTE sigue apuntando a la página física original **`0x87f44000`**.
+* Mantiene sus permisos en **`W=0`** y **`COW=1`**.
+* El único efecto a nivel de kernel es que el contador de referencias de `0x87f44000` bajó de 2 a 1. Si el padre intenta escribir después, `cowfault()` verá que `refcount == 1` y le devolverá el permiso `W=1` sobre esa misma página física sin volver a duplicar memoria.
+
+---
 
 ## 2. Páginas sin PTE_W y USYSCALL en fork()
 
-_(Persona 1 — pendiente.)_
+### Páginas de código y página de guarda (Guard Page)
+
+* **Comportamiento en `fork()`:** Durante la clonación del proceso en `uvmcopy()`, el kernel únicamente aplica la lógica CoW a las entradas que tienen activo el permiso de escritura (`PTE_W`). Las páginas de código (que son solo lectura/ejecutables) y la página de guarda del stack (que no tiene permisos `PTE_U` ni `PTE_W`) se mapean en el proceso hijo conservando sus permisos originales, sin marcar el bit `PTE_COW`.
+* **¿Por qué no se marcan como CoW?**: CoW está diseñado únicamente para páginas que los procesos tienen derecho a modificar legítimamente. Si el código o la página de guarda se marcaran como CoW, un intento erróneo o malicioso de escritura no generaría un fallo de segmentación (Segmentation Fault), sino que `cowfault()` interceptaría la trampa, crearía una copia física privada y le otorgaría permisos de escritura (`PTE_W`). Esto rompería la protección del sistema, permitiendo a un proceso modificar sus propias instrucciones o corromper memoria al desbordar la pila sobre la página de guarda.
+
+### Manejo de `USYSCALL`
+
+* **Comportamiento en `fork()`:** La página `USYSCALL` es una región compartida de solo lectura en espacio de usuario (`PTE_R` y `PTE_U`, pero sin `PTE_W`). Dado que el usuario nunca escribe en ella, `uvmcopy()` no le asigna el bit `PTE_COW`. Al hacer `fork()`, el kernel asigna una nueva página física independiente para el proceso hijo que apunta a su propia estructura `struct usyscall`.
+* **¿Qué fallaría en `ugetpid()` si se compartiera?**: La función `ugetpid()` es una optimización en espacio de usuario que lee el PID del proceso directamente desde la página `USYSCALL` para evitar el costo de una trampa al kernel. Si el padre y el hijo compartieran la misma página física de `USYSCALL`, ambos leerían siempre el PID del proceso padre. Como consecuencia, la llamada `ugetpid()` en el hijo devolvería un PID incorrecto, rompiendo la identidad del proceso y haciendo fallar los tests del sistema.
+
+---
 
 ## 3. Carrera en el conteo de referencias
 
-_(Persona 1 — pendiente.)_
+Cuando múltiples CPUs leen y modifican el contador de referencias de una página física sin la protección de un `spinlock`, las operaciones de lectura, modificación y escritura dejan de ser atómicas, generando condiciones de carrera críticas.
+
+### Escenario A: Pérdida de una página para siempre (Fuga de memoria / Memory Leak)
+
+Supongamos que una página física `pa` está compartida por dos procesos (Padre e Hijo) y su contador es `count = 2`. Ambos procesos finalizan al mismo tiempo en CPUs distintas y llaman a `kfree(pa)`:
+
+1. **Tiempo T1 (CPU 0 - Padre):** Ejecuta `kfree(pa)` y lee la memoria: `count = 2`.
+2. **Tiempo T2 (CPU 1 - Hijo):** Ejecuta `kfree(pa)` de forma simultánea y lee la misma memoria: `count = 2`.
+3. **Tiempo T3 (CPU 0):** Calcula `2 - 1 = 1`, escribe `count = 1` y verifica si `count == 0` (falso, no libera a `freelist`).
+4. **Tiempo T4 (CPU 1):** Calcula `2 - 1 = 1` (basado en su lectura de T2), escribe `count = 1` y verifica si `count == 0` (falso, no libera a `freelist`).
+
+**Resultado:** Ambos procesos terminaron y liberaron la página, pero el contador quedó en `1` en lugar de `0`. La página física queda "huérfana": ningún proceso la está usando y nunca volverá a la lista de páginas libres (`freelist`), perdiéndose memoria para siempre.
+
+### Escenario B: Liberar una página que otro proceso todavía usa (Uso después de liberación / Use-After-Free)
+
+Supongamos que una página física `pa` tiene `count = 1`. El Proceso A en CPU 0 la está liberando con `kfree(pa)` mientras el Proceso B en CPU 1 intenta duplicarla haciendo `fork()` con `krefinc(pa)`:
+
+1. **Tiempo T1 (CPU 0 - `kfree`):** Lee `count = 1`.
+2. **Tiempo T2 (CPU 1 - `krefinc`):** Lee `count = 1`.
+3. **Tiempo T3 (CPU 0 - `kfree`):** Decrementa a `0`, detecta `count == 0` y coloca la página física en la `freelist`.
+4. **Tiempo T4 (CPU 1 - `krefinc`):** Incrementa su lectura previa (`1 + 1 = 2`) y escribe `count = 2`.
+5. **Tiempo T5:** Un Proceso C solicita memoria con `kalloc()`, recibe la página recién devuelta a la `freelist` y empieza a escribir datos en ella.
+
+**Resultado:** La página física fue reciclada por el asignador mientras el Proceso B aún la tiene mapeada en su tabla de páginas. Las escrituras del Proceso C corromperán la memoria del Proceso B, causando fallos impredecibles o violaciones de seguridad.
+
+---
 
 ## 4. Consistencia del snapshot
 
